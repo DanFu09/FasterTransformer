@@ -54,6 +54,7 @@ def main():
     )
     parser.add_argument('--rougeLsum_threshold', type=float,
                         help='Threshold of FT rougeLsum score')
+    parser.add_argument('--batch_size', type=int, default=1)
 
 
 
@@ -99,7 +100,7 @@ def main():
     top_p = 0.0
     temperature = 1
     max_seq_len = hf_config['max_position_embeddings']
-    max_batch_size = 1
+    max_batch_size = args.batch_size
     repetition_penalty = 1
     vocab_size = hf_config['vocab_size']
     tensor_para_size = args.tensor_para_size
@@ -156,10 +157,14 @@ def main():
             line_encoded = line_encoded[:, -923:]
         else:
             line_encoded = line_encoded[:, -768:]
+        line_encoded = line_encoded.repeat([max_batch_size, 1])
+        for i in range(max_batch_size):
+            line_encoded[i, i] = line_encoded[i, max_batch_size + 1]
         line_encoded = line_encoded.type(torch.int32)
-
         with torch.no_grad():
-            output, ft_output_len = gpt(line_encoded, torch.IntTensor([len(line_encoded[0])]),
+            output, ft_output_len = gpt(
+                line_encoded,
+                torch.IntTensor([len(line_encoded[0]) for i in range(max_batch_size)]),
                                         output_len,
                                         1,
                                         top_k * torch.ones(size=[max_batch_size], dtype=torch.int32),
@@ -177,6 +182,12 @@ def main():
         output_lines = ".".join(output_lines.split('.')[:4]) + "."
         return output_lines, tokens
 
+    os.environ["prob_thresh"] = "0"
+    os.environ["ffa_thersh"] = "0"
+    os.environ["max_tokens"] = str(output_len)
+    os.environ["use_ffa"] = "0"
+    os.environ["use_ffa_default_kl"] = str(1) 
+
     def summarize_hf(datapoint):
         if summarize:
             line = datapoint['article'] + ' TL;DR: '
@@ -192,11 +203,11 @@ def main():
             line_encoded = line_encoded[:, -768:]
         # line_encoded = line_encoded.to(device_hf)
         line_encoded = line_encoded.cuda()
-
+        line_encoded = line_encoded.repeat([max_batch_size, 1])
         with torch.no_grad():
             output = model.generate(line_encoded,
                                     max_length=len(line_encoded[0]) + output_len,
-                                    k=top_k,
+                                    # k=top_k,
                                     temperature=temperature,
                                     eos_token_id=tokenizer.eos_token_id,
                                     pad_token_id=tokenizer.pad_token_id)
@@ -205,7 +216,7 @@ def main():
         output_lines = tokenizer.decode(output[0][len(line_encoded[0]):])
         output_lines = ".".join(output_lines.split('.')[:4]) + "."
         return output_lines, tokens
-
+    
     if summarize:
         datapoint = dataset_cnn['test'][0]
         summary, _ = summarize_ft(datapoint)
@@ -228,11 +239,13 @@ def main():
     if summarize:
         metric_ft = load_metric("rouge")
         metric_hf = load_metric("rouge")
+        metric_ffa = load_metric("rouge")
     else:
         tokens = []
 
     ft_time = 0.0
     hf_time = 0.0
+    ffa_time = 0.0
     for data_point_idx in tqdm(range(1, 11490, int(11490 / args.max_ite))):
         try:
             datapoint = dataset_cnn['test'][data_point_idx]
@@ -241,17 +254,30 @@ def main():
             summary_ft, tokens_ft = summarize_ft(datapoint)
             stop_time = datetime.now()
             ft_time += (stop_time - start_time).total_seconds()
+
             if (test_hf and summarize) or not summarize:
+                os.environ["use_ffa"] = str(0)
+                os.environ["use_ffa_default_kl"] = str(0) 
+
                 start_time = datetime.now()
                 summary_hf, tokens_hf = summarize_hf(datapoint)
                 stop_time = datetime.now()
                 hf_time += (stop_time - start_time).total_seconds()
+
+                os.environ["use_ffa"] = str(1)
+                os.environ["use_ffa_default_kl"] = str(1) 
+
+                start_time = datetime.now()
+                summary_ffa, tokens_ffa = summarize_hf(datapoint)
+                stop_time = datetime.now()
+                ffa_time += (stop_time - start_time).total_seconds()
 
             if rank == 0:
                 if summarize:
                     metric_ft.add_batch(predictions=[summary_ft], references=[datapoint['highlights']])
                     if test_hf:
                         metric_hf.add_batch(predictions=[summary_hf], references=[datapoint['highlights']])
+                        metric_ffa.add_batch(predictions=[summary_ffa], references=[datapoint['highlights']])
                 else:
                     tokens.append((tokens_ft, tokens_hf))
         except:
@@ -286,6 +312,12 @@ def main():
                 print(f'Hugging Face (total latency: {hf_time} sec)')
                 for key in computed_metrics_hf.keys():
                     print(f'{key} : {computed_metrics_hf[key].mid[2]*100}')
+
+                computed_metrics_ffa = metric_ffa.compute()
+
+                print(f'FastForwardAttention (total latency: {ffa_time} sec)')
+                for key in computed_metrics_ffa.keys():
+                    print(f'{key} : {computed_metrics_ffa[key].mid[2]*100}')
 
             print(f'Faster Transformers (total latency: {ft_time} sec)')
             for key in computed_metrics_ft.keys():
